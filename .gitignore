@@ -1,0 +1,39 @@
+# Compiled executable
+mcp-council
+
+# Database files
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Deno
+.deno/
+deno.lock
+
+# Node modules (npm compatibility)
+node_modules/
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Logs
+*.log
+npm-debug.log*
