@@ -10,7 +10,7 @@ import {
   buildSystemPrompt,
   generatePersona,
 } from "./persona.ts";
-import { generateCandidateId } from "./utils/id.ts";
+import { generateId } from "./utils/id.ts";
 import { defaultLogger, type Logger } from "./utils/logger.ts";
 import {
   resilientParallel,
@@ -447,7 +447,7 @@ Would you like to refine any aspect? Respond in JSON:
     );
 
     const candidate: Candidate = {
-      id: generateCandidateId(),
+      id: generateId(),
       persona,
       createdAt: Date.now(),
       fitness: 0,

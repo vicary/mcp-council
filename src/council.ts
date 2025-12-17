@@ -6,7 +6,7 @@ import { CandidatePool } from "./candidate-pool.ts";
 import type { Candidate, CouncilDB, CouncilState, Member } from "./db.ts";
 import type { LLMProvider } from "./llm.ts";
 import { buildCouncilIntro } from "./persona.ts";
-import { generateMemberId } from "./utils/id.ts";
+import { generateId } from "./utils/id.ts";
 import { defaultLogger, type Logger } from "./utils/logger.ts";
 
 const COUNCIL_SIZE = 8;
@@ -81,7 +81,7 @@ export class Council {
 
       // Convert to member
       const member: Member = {
-        id: generateMemberId(),
+        id: generateId(),
         persona: candidate.persona,
         createdAt: candidate.createdAt,
         promotedAt: Date.now(),

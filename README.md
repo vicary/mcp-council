@@ -62,8 +62,7 @@ Add to your `settings.json`:
       "council": {
         "command": "/path/to/mcp-council",
         "env": {
-          "OPENAI_API_KEY": "your-api-key",
-          "COUNCIL_DB_PATH": "/path/to/council.db"
+          "OPENAI_API_KEY": "your-api-key"
         }
       }
     }
@@ -81,8 +80,7 @@ Add to your `claude_desktop_config.json`:
     "council": {
       "command": "/path/to/mcp-council",
       "env": {
-        "OPENAI_API_KEY": "your-api-key",
-        "COUNCIL_DB_PATH": "/path/to/council.db"
+        "OPENAI_API_KEY": "your-api-key"
       }
     }
   }

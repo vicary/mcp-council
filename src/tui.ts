@@ -515,7 +515,7 @@ async function showMemberDetails(
     if (confirm?.value === "confirm") {
       // Convert member to candidate
       const candidate: Candidate = {
-        id: member.id.replace("mem_", "cand_"),
+        id: member.id,
         persona: member.persona,
         createdAt: member.createdAt,
         fitness: 0,
