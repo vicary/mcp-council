@@ -123,6 +123,18 @@ export class CandidatePool {
     candidates: Candidate[],
     prompt: string,
   ): Promise<{ proposals: Proposal[]; errors: RetryExhaustedError[] }> {
+    const userContent = `Practice round query: "${prompt}"
+
+Propose a response aligned with your values. This is practice for potential council promotion.
+CRITICAL: Your proposal should offer a DISTINCT perspective from what others might propose. Avoid generic responses.
+Focus on being "divergent yet considerate" - offer a unique angle while respecting the complexity of the issue.
+
+Respond in JSON format:
+{
+  "content": "your proposed response",
+  "reasoning": "why this response aligns with your values and offers a unique perspective"
+}`;
+
     const operations = candidates.map((candidate) => ({
       label: `practice proposal from ${candidate.persona.name}`,
       fn: async (): Promise<Proposal> => {
@@ -135,17 +147,7 @@ export class CandidatePool {
           ...candidate.chatHistory.slice(-5),
           {
             role: "user",
-            content: `Practice round query: "${prompt}"
-
-Propose a response aligned with your values. This is practice for potential council promotion.
-CRITICAL: Your proposal should offer a DISTINCT perspective from what others might propose. Avoid generic responses.
-Focus on being "divergent yet considerate" - offer a unique angle while respecting the complexity of the issue.
-
-Respond in JSON format:
-{
-  "content": "your proposed response",
-  "reasoning": "why this response aligns with your values and offers a unique perspective"
-}`,
+            content: userContent,
             timestamp: Date.now(),
           },
         ];
@@ -154,6 +156,19 @@ Respond in JSON format:
           content: string;
           reasoning: string;
         }>(messages, "");
+
+        // Save the prompt and response to chat history
+        candidate.chatHistory.push({
+          role: "user",
+          content: userContent,
+          timestamp: Date.now(),
+        });
+        candidate.chatHistory.push({
+          role: "assistant",
+          content: JSON.stringify(response),
+          timestamp: Date.now(),
+        });
+        await this.db.saveCandidate(candidate);
 
         return {
           memberId: candidate.id,

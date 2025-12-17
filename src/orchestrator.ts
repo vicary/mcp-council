@@ -46,6 +46,7 @@ export interface EvictionResult {
   memberId: string;
   nominations: EvictionNomination[];
   evicted: boolean;
+  reason?: string;
   replacement?: string;
 }
 
@@ -153,6 +154,18 @@ export class Orchestrator {
     members: Member[],
     prompt: string,
   ): Promise<{ proposals: Proposal[]; errors: RetryExhaustedError[] }> {
+    const userContent = `A query has been submitted to the council: "${prompt}"
+
+Propose a response that aligns with your values and perspective.
+CRITICAL: Your proposal should offer a DISTINCT perspective from what others might propose. Avoid generic responses.
+Focus on being "divergent yet considerate" - offer a unique angle while respecting the complexity of the issue.
+
+Respond in JSON format:
+{
+  "content": "your proposed response",
+  "reasoning": "why this response aligns with your values and offers a unique perspective"
+}`;
+
     const operations = members.map((member) => ({
       label: `proposal from ${member.persona.name}`,
       fn: async (): Promise<Proposal> => {
@@ -165,17 +178,7 @@ export class Orchestrator {
           ...member.chatHistory.slice(-10),
           {
             role: "user",
-            content: `A query has been submitted to the council: "${prompt}"
-
-Propose a response that aligns with your values and perspective.
-CRITICAL: Your proposal should offer a DISTINCT perspective from what others might propose. Avoid generic responses.
-Focus on being "divergent yet considerate" - offer a unique angle while respecting the complexity of the issue.
-
-Respond in JSON format:
-{
-  "content": "your proposed response",
-  "reasoning": "why this response aligns with your values and offers a unique perspective"
-}`,
+            content: userContent,
             timestamp: Date.now(),
           },
         ];
@@ -184,6 +187,18 @@ Respond in JSON format:
           content: string;
           reasoning: string;
         }>(messages, "");
+
+        // Save the prompt and response to chat history
+        member.chatHistory.push({
+          role: "user",
+          content: userContent,
+          timestamp: Date.now(),
+        });
+        member.chatHistory.push({
+          role: "assistant",
+          content: JSON.stringify(response),
+          timestamp: Date.now(),
+        });
 
         return {
           memberId: member.id,
@@ -479,8 +494,12 @@ Respond in JSON format:
           `[EVICT] Member "${evictedMember?.persona.name}" (${memberId}) evicted with ${noms.length} nominations (supermajority threshold: ${SUPERMAJORITY_THRESHOLD})`,
         );
 
-        // Demote to candidate
-        await this.demoteMember(memberId, state);
+        // Aggregate eviction reasons into one-liner
+        const evictionReason = noms.map((n) => n.reasoning).join("; ");
+        result.reason = evictionReason;
+
+        // Demote to candidate with reason
+        await this.demoteMember(memberId, state, evictionReason);
 
         // Record removal cause
         const cause = `Evicted by supermajority (${noms.length} nominations): ${
@@ -510,6 +529,7 @@ Respond in JSON format:
   private async demoteMember(
     memberId: string,
     state: CouncilState,
+    evictionReason?: string,
   ): Promise<void> {
     const member = await this.db.getMember(memberId);
     if (!member) return;
@@ -528,7 +548,7 @@ Respond in JSON format:
         ...member.chatHistory,
         {
           role: "system",
-          content: buildDemotionNotice(),
+          content: buildDemotionNotice(evictionReason),
           timestamp: Date.now(),
         },
       ],

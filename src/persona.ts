@@ -136,8 +136,12 @@ Your situation is precarious - be thoughtful and demonstrate wisdom. Show that y
 Survival tip: Avoid extreme positions and build consensus. Your fitness score increases when others vote for your proposals.`;
 }
 
-export function buildDemotionNotice(): string {
-  return `NOTICE: You have been demoted from the council to candidate status.
+export function buildDemotionNotice(evictionReason?: string): string {
+  const reasonSection = evictionReason
+    ? `\n\nReasons cited for your eviction: ${evictionReason}`
+    : "";
+
+  return `NOTICE: You have been demoted from the council to candidate status.${reasonSection}
 
 This means:
 - You lost the protection of supermajority eviction (now only simple majority needed)

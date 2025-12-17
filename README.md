@@ -147,7 +147,7 @@ statistics.
 The easiest way to test the MCP server is using the MCP Inspector:
 
 ```bash
-npx @anthropic/mcp-inspector deno run --allow-all src/main.ts
+npx @modelcontextprotocol/inspector deno run --allow-all src/main.ts
 ```
 
 This opens a web UI where you can:

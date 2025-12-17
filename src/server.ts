@@ -63,11 +63,12 @@ export function formatVoteResult(result: VoteResult): string {
         const memberIndex = result.proposals.findIndex((p) =>
           p.memberId === e.memberId
         ) + 1;
+        const reasonText = e.reason ? `\n  Reasons: ${e.reason}` : "";
         return `- Member ${memberIndex}: ${
           e.evicted
             ? `EVICTED (${e.nominations.length} nominations)${
               e.replacement ? ` → replaced by ${e.replacement}` : ""
-            }`
+            }${reasonText}`
             : `${e.nominations.length} nominations (not enough for supermajority)`
         }`;
       })
