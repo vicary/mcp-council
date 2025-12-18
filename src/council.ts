@@ -11,10 +11,15 @@ import { defaultLogger, type Logger } from "./utils/logger.ts";
 
 const COUNCIL_SIZE = 8;
 const INITIAL_POOL_SIZE = 20;
+const MIN_COUNCIL_SIZE = 3;
+const POOL_RECOVERY_INTERVAL_MS = 5000;
 
 export class Council {
   private candidatePool: CandidatePool;
   private logger: Logger;
+  private operationInProgress = false;
+  private isRecoveryRunning = false;
+  private currentSleepTimer: number | null = null;
 
   constructor(
     private db: CouncilDB,
@@ -26,43 +31,174 @@ export class Council {
   }
 
   /**
-   * Bootstrap the council on startup
+   * Check if the council has minimum required members for voting
    */
-  async bootstrap(): Promise<void> {
+  async hasMinimumMembers(): Promise<boolean> {
     const state = await this.db.getCouncilState();
+    return state.memberIds.length >= MIN_COUNCIL_SIZE;
+  }
 
-    // Restore existing members and candidates from DB
-    const existingMembers = await this.db.getAllMembers();
-    const existingCandidates = await this.db.getAllCandidates();
+  /**
+   * Get current member count
+   */
+  async getMemberCount(): Promise<number> {
+    const state = await this.db.getCouncilState();
+    return state.memberIds.length;
+  }
 
-    // Sync state with actual DB contents
-    state.memberIds = existingMembers.map((m) => m.id);
-    state.candidateIds = existingCandidates.map((c) => c.id);
+  /**
+   * Mark an operation as in progress (blocks recovery)
+   */
+  setOperationInProgress(inProgress: boolean): void {
+    this.operationInProgress = inProgress;
+  }
 
-    // Ensure target pool size is set
-    if (state.targetPoolSize === 0) {
-      state.targetPoolSize = INITIAL_POOL_SIZE;
+  /**
+   * Check if an operation is currently in progress
+   */
+  isOperationInProgress(): boolean {
+    return this.operationInProgress;
+  }
+
+  /**
+   * Start periodic pool recovery checks
+   * Runs recursively with a delay between checks
+   */
+  async startPeriodicRecovery(): Promise<void> {
+    if (this.isRecoveryRunning) {
+      return; // Already running
     }
 
-    // If council is not full, first ensure we have enough candidates, then promote
-    if (state.memberIds.length < COUNCIL_SIZE) {
-      // Step 1: Create candidates until we have enough to fill the council
-      const needed = COUNCIL_SIZE - state.memberIds.length;
-      while (state.candidateIds.length < needed) {
-        await this.candidatePool.createCandidate(state);
-        // Re-read state from DB to get the newly created candidate IDs
-        const freshState = await this.db.getCouncilState();
-        state.candidateIds = freshState.candidateIds;
+    this.isRecoveryRunning = true;
+    this.logger.operation(
+      "[RECOVERY] Starting periodic pool recovery loop",
+    );
+
+    // Start the recursive loop
+    return await this.runRecoveryLoop();
+  }
+
+  /**
+   * Stop periodic pool recovery
+   */
+  stopPeriodicRecovery(): void {
+    if (this.isRecoveryRunning) {
+      this.isRecoveryRunning = false;
+      if (this.currentSleepTimer !== null) {
+        clearTimeout(this.currentSleepTimer);
+        this.currentSleepTimer = null;
+      }
+      this.logger.operation("[RECOVERY] Stopping periodic pool recovery loop");
+    }
+  }
+
+  /**
+   * Recursive recovery loop
+   */
+  private async runRecoveryLoop(): Promise<void> {
+    if (!this.isRecoveryRunning) return;
+
+    const startTime = Date.now();
+
+    // Run the check
+    await this.runRecoveryCheck();
+
+    if (!this.isRecoveryRunning) return;
+
+    // Calculate delay
+    const duration = Date.now() - startTime;
+    const delay = Math.max(0, POOL_RECOVERY_INTERVAL_MS - duration);
+
+    if (delay > 0) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+          resolve();
+        }, delay);
+
+        // If we stop, we should ideally clear this timeout, but we don't have a reference to it outside.
+        // Instead, we can check isRecoveryRunning inside the callback?
+        // No, the promise needs to resolve for the loop to continue (and then check flag).
+        // But for tests, we need to ensure no pending timers.
+
+        // Let's store the timer ID so stopPeriodicRecovery can clear it.
+        // But this is a local variable.
+        // We can use a class property for the current sleep timer.
+        this.currentSleepTimer = timer;
+      });
+      this.currentSleepTimer = null;
+    }
+
+    // Recursive call for next round
+    if (this.isRecoveryRunning) {
+      await this.runRecoveryLoop();
+    }
+  }
+
+  /**
+   * Run a single recovery check
+   * Skipped if an operation is in progress
+   */
+  private async runRecoveryCheck(): Promise<void> {
+    if (this.operationInProgress) {
+      this.logger.operation(
+        "[RECOVERY] Skipping recovery check - operation in progress",
+      );
+      return;
+    }
+
+    try {
+      const state = await this.db.getCouncilState();
+
+      // Restore existing members and candidates from DB
+      const existingMembers = await this.db.getAllMembers();
+      const existingCandidates = await this.db.getAllCandidates();
+
+      // Sync state with actual DB contents
+      state.memberIds = existingMembers.map((m) => m.id);
+      state.candidateIds = existingCandidates.map((c) => c.id);
+
+      // Ensure target pool size is set
+      if (state.targetPoolSize === 0) {
+        state.targetPoolSize = INITIAL_POOL_SIZE;
       }
 
-      // Step 2: Now promote candidates to fill the council
-      await this.initializeCouncil(state);
+      // If council is not full, try to create one candidate per check
+      // This spreads the load across multiple recovery cycles
+      if (state.memberIds.length < COUNCIL_SIZE) {
+        const needed = COUNCIL_SIZE - state.memberIds.length;
+
+        if (state.candidateIds.length < needed) {
+          // Create one candidate per recovery cycle to spread load
+          this.logger.operation(
+            `[RECOVERY] Creating candidate (${
+              state.candidateIds.length + 1
+            }/${needed} needed for council)",`,
+          );
+          await this.candidatePool.createCandidate(state);
+          await this.db.saveCouncilState(state);
+          return; // Exit early, will continue in next cycle
+        }
+
+        // Enough candidates exist, promote to fill council
+        await this.initializeCouncil(state);
+      }
+
+      // Replenish candidate pool one at a time
+      if (state.candidateIds.length < state.targetPoolSize) {
+        this.logger.operation(
+          `[RECOVERY] Replenishing pool (${state.candidateIds.length}/${state.targetPoolSize})",`,
+        );
+        await this.candidatePool.createCandidate(state);
+      }
+
+      await this.db.saveCouncilState(state);
+    } catch (error) {
+      this.logger.operation(
+        `[RECOVERY] Error during recovery check: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
-
-    // Finally, replenish the candidate pool to target size
-    await this.candidatePool.replenishPool(state);
-
-    await this.db.saveCouncilState(state);
   }
 
   /**

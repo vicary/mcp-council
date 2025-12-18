@@ -5,7 +5,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-
 import { Council } from "./council.ts";
 import { CouncilDB } from "./db.ts";
 import { OpenAIProvider } from "./llm.ts";
@@ -108,10 +107,68 @@ export async function createServer(): Promise<McpServer> {
         ),
       },
     },
-    async ({ prompt }) => {
+    async ({ prompt }, { sendNotification, _meta }) => {
+      const progressToken = _meta?.progressToken;
+
+      const sendProgress = async (
+        progress: number,
+        total: number,
+        message: string,
+      ) => {
+        if (progressToken !== undefined) {
+          await sendNotification({
+            method: "notifications/progress",
+            params: { progressToken, progress, total, message },
+          });
+        }
+      };
+
       try {
         const { council, orchestrator } = getCouncil();
-        const result = await orchestrator.vote(prompt);
+
+        // Check minimum council size before proceeding
+        if (!(await council.hasMinimumMembers())) {
+          const memberCount = await council.getMemberCount();
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `Council has insufficient members (${memberCount}/3 minimum required). Pool recovery is in progress. Please try again in a few moments.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        // Mark operation as in progress to pause recovery
+        council.setOperationInProgress(true);
+
+        // Progress: Starting proposal round
+        await sendProgress(
+          1,
+          4,
+          "Collecting proposals from the council.",
+        );
+
+        const result = await orchestrator.vote(prompt, {
+          onProposalsCollected: async () => {
+            await sendProgress(
+              2,
+              4,
+              "Council is voting on proposals.",
+            );
+          },
+          onVotingComplete: async () => {
+            await sendProgress(
+              3,
+              4,
+              "Voting complete, processing evictions.",
+            );
+          },
+        });
+
+        await sendProgress(4, 4, "Council deliberation complete.");
 
         // Run candidate practice round in background
         council.getCandidatePool().runPracticeRound(prompt).catch(
@@ -138,6 +195,9 @@ export async function createServer(): Promise<McpServer> {
           ],
           isError: true,
         };
+      } finally {
+        // Always clear operation flag, even on error
+        council.setOperationInProgress(false);
       }
     },
   );
@@ -196,8 +256,9 @@ ${candidateList}
     },
   );
 
-  // Bootstrap council asynchronously - don't block server from responding to requests
-  council.bootstrap().catch(console.error);
+  // Start periodic pool recovery instead of bootstrap
+  // This spreads the initialization load and makes recovery more resilient
+  council.startPeriodicRecovery();
 
   return server;
 }

@@ -75,6 +75,14 @@ export interface VoteResult {
 
 const SUPERMAJORITY_THRESHOLD = 6;
 
+/**
+ * Progress callbacks for vote operation
+ */
+export interface VoteProgressCallbacks {
+  onProposalsCollected?: () => Promise<void>;
+  onVotingComplete?: () => Promise<void>;
+}
+
 export class Orchestrator {
   constructor(
     private db: CouncilDB,
@@ -85,7 +93,10 @@ export class Orchestrator {
   /**
    * Main voting flow entry point
    */
-  async vote(prompt: string): Promise<VoteResult> {
+  async vote(
+    prompt: string,
+    callbacks?: VoteProgressCallbacks,
+  ): Promise<VoteResult> {
     const state = await this.db.getCouncilState();
     const members: Member[] = [];
     for (const id of state.memberIds) {
@@ -111,10 +122,16 @@ export class Orchestrator {
       );
     }
 
+    // Notify: Proposals collected
+    await callbacks?.onProposalsCollected?.();
+
     // Round 2: Selection (parallel with retry)
     const { votes, winner, tieBreak, errors: voteErrors } = await this
       .selectProposal(members, proposals);
     allErrors.push(...voteErrors);
+
+    // Notify: Voting complete
+    await callbacks?.onVotingComplete?.();
 
     // Round 3: Eviction (parallel with retry)
     const { evictions, errors: evictionErrors } = await this.processEvictions(

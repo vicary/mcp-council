@@ -2,7 +2,12 @@
  * Tests for Council bootstrap and lifecycle
  */
 
-import { assertEquals, assertExists, assertGreater } from "@std/assert";
+import {
+  assertEquals,
+  assertExists,
+  assertFalse,
+  assertGreater,
+} from "@std/assert";
 import { afterEach, beforeEach, describe, it } from "@std/testing/bdd";
 import { Council } from "./council.ts";
 import { CouncilDB, type Persona } from "./db.ts";
@@ -30,41 +35,56 @@ describe("Council", () => {
   });
 
   afterEach(() => {
+    council.stopPeriodicRecovery();
     db.close();
   });
 
-  describe("bootstrap", () => {
-    it("should create initial council of 8 members", async () => {
+  describe("periodic recovery", () => {
+    it("should create candidates incrementally through recovery cycles", async () => {
       // Set a smaller pool size for testing
       const state = await db.getCouncilState();
-      state.targetPoolSize = 5;
+      state.targetPoolSize = 2;
       await db.saveCouncilState(state);
 
-      // Need to mock persona generation:
-      // - 8 candidates to promote to members
-      // - 5 candidates to fill the pool after promotion
-      for (let i = 0; i < 13; i++) {
-        llm.pushResponse(
-          JSON.stringify({
-            name: `Generated ${i}`,
-            values: ["value"],
-            traits: ["trait"],
-            background: "Generated",
-            decisionStyle: "style",
-          }),
-        );
-      }
+      // Mock persona generation for first recovery cycle (creates 1 candidate)
+      llm.pushResponse(
+        JSON.stringify({
+          name: `Generated 0`,
+          values: ["value"],
+          traits: ["trait"],
+          background: "Generated",
+          decisionStyle: "style",
+        }),
+      );
 
-      await council.bootstrap();
+      // Call the recovery cycle through startPeriodicRecovery + wait
+      // Since we don't have direct access, we test through getStatus after manual trigger
+      // We need to expose recovery for testing, so let's test through behavior
 
-      const status = await council.getStatus();
-      assertEquals(status.members.length, 8);
+      // Initial state should have no candidates
+      let status = await council.getStatus();
+      assertEquals(status.candidates.length, 0);
+
+      // After recovery runs, we should have started creating candidates
+      // Since startPeriodicRecovery runs immediately, we can test the first cycle
+      council.startPeriodicRecovery();
+
+      // Wait a bit for the first cycle to complete
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      status = await council.getStatus();
+      // Should have created at least 1 candidate in first cycle
+      assertGreater(
+        status.candidates.length,
+        0,
+        "Should have created candidates",
+      );
     });
 
-    it("should restore existing members on bootstrap", async () => {
+    it("should restore existing members on recovery", async () => {
       // Pre-populate with members
       const state = await db.getCouncilState();
-      state.targetPoolSize = 5;
+      state.targetPoolSize = 0; // No candidates needed
       for (let i = 1; i <= 8; i++) {
         await db.saveMember({
           id: `mem_${i}`,
@@ -77,89 +97,53 @@ describe("Council", () => {
       }
       await db.saveCouncilState(state);
 
-      // Mock for candidate pool replenishment (5 candidates)
-      for (let i = 0; i < 5; i++) {
-        llm.pushResponse(
-          JSON.stringify({
-            name: `Candidate ${i}`,
-            values: ["value"],
-            traits: ["trait"],
-            background: "Background",
-            decisionStyle: "style",
-          }),
-        );
-      }
+      // No mock responses needed - existing members should be found
+      council.startPeriodicRecovery();
 
-      await council.bootstrap();
+      // Wait for first cycle
+      await new Promise((resolve) => setTimeout(resolve, 100));
 
       const status = await council.getStatus();
       assertEquals(status.members.length, 8);
       assertEquals(status.members[0].persona.name, "Existing 1");
     });
 
-    it("should restore existing candidates on bootstrap", async () => {
-      // Pre-populate with candidates
-      const state = await db.getCouncilState();
-      state.targetPoolSize = 5;
-
-      for (let i = 1; i <= 5; i++) {
-        await db.saveCandidate({
-          id: `cand_${i}`,
-          persona: createMockPersona(`Candidate ${i}`),
-          createdAt: Date.now(),
-          fitness: i * 2,
-          chatHistory: [],
-        });
-        state.candidateIds.push(`cand_${i}`);
-      }
-      await db.saveCouncilState(state);
-
-      // Mock for member creation (need 8 - 5 = 3 more candidates, then replenish 5)
-      for (let i = 0; i < 8; i++) {
-        llm.pushResponse(
-          JSON.stringify({
-            name: `Generated ${i}`,
-            values: ["value"],
-            traits: ["trait"],
-            background: "Background",
-            decisionStyle: "style",
-          }),
-        );
-      }
-
-      await council.bootstrap();
-
-      const status = await council.getStatus();
-      assertEquals(status.members.length, 8);
-      // Some candidates should have been promoted
-    });
-
-    it("should create candidates to reach target pool size", async () => {
-      // Set a smaller pool size for testing
+    it("should skip recovery when operation is in progress", async () => {
+      // Set up state where recovery would create candidates
       const state = await db.getCouncilState();
       state.targetPoolSize = 5;
       await db.saveCouncilState(state);
 
-      // Mock for all persona generations (8 members + 5 candidates)
-      for (let i = 0; i < 13; i++) {
-        llm.pushResponse(
-          JSON.stringify({
-            name: `Entity ${i}`,
-            values: ["value"],
-            traits: ["trait"],
-            background: "Background",
-            decisionStyle: "style",
-          }),
-        );
-      }
+      // Mock persona generation
+      llm.pushResponse(
+        JSON.stringify({
+          name: `Generated`,
+          values: ["value"],
+          traits: ["trait"],
+          background: "Generated",
+          decisionStyle: "style",
+        }),
+      );
 
-      await council.bootstrap();
+      // Mark operation in progress
+      council.setOperationInProgress(true);
+
+      // Start recovery - it should skip because operation is in progress
+      council.startPeriodicRecovery();
+
+      // Wait for cycle
+      await new Promise((resolve) => setTimeout(resolve, 100));
 
       const status = await council.getStatus();
-      assertGreater(status.candidates.length, 0);
+      // Should NOT have created any candidates because operation was in progress
+      assertEquals(
+        status.candidates.length,
+        0,
+        "Should not create candidates when operation in progress",
+      );
     });
 
-    it("should preserve existing members and candidates on restart", async () => {
+    it("should preserve existing members and candidates on recovery", async () => {
       // Simulate a fully initialized council
       const state = await db.getCouncilState();
       state.targetPoolSize = 3;
@@ -198,8 +182,11 @@ describe("Council", () => {
 
       await db.saveCouncilState(state);
 
-      // No mock responses needed - should NOT create anything new
-      await council.bootstrap();
+      // Start recovery - should NOT create anything new
+      council.startPeriodicRecovery();
+
+      // Wait for cycle
+      await new Promise((resolve) => setTimeout(resolve, 100));
 
       const status = await council.getStatus();
 
@@ -275,8 +262,9 @@ describe("Council", () => {
         db = await CouncilDB.open(tempPath);
         council = new Council(db, llm, silentLogger);
 
-        // Bootstrap should NOT create new members/candidates
-        await council.bootstrap();
+        // Recovery should NOT create new members/candidates
+        council.startPeriodicRecovery();
+        await new Promise((resolve) => setTimeout(resolve, 100));
 
         const status = await council.getStatus();
 
@@ -374,6 +362,45 @@ describe("Council", () => {
     it("should return candidate pool manager", () => {
       const pool = council.getCandidatePool();
       assertExists(pool);
+    });
+  });
+
+  describe("hasMinimumMembers", () => {
+    it("should return false when council has fewer than 3 members", async () => {
+      const state = await db.getCouncilState();
+      state.memberIds = ["mem_1", "mem_2"];
+      await db.saveCouncilState(state);
+
+      assertFalse(await council.hasMinimumMembers());
+    });
+
+    it("should return true when council has 3 or more members", async () => {
+      const state = await db.getCouncilState();
+      for (let i = 1; i <= 3; i++) {
+        await db.saveMember({
+          id: `mem_${i}`,
+          persona: createMockPersona(`Member ${i}`),
+          createdAt: Date.now(),
+          promotedAt: Date.now(),
+          chatHistory: [],
+        });
+        state.memberIds.push(`mem_${i}`);
+      }
+      await db.saveCouncilState(state);
+
+      assertEquals(await council.hasMinimumMembers(), true);
+    });
+  });
+
+  describe("operation tracking", () => {
+    it("should track operation in progress state", () => {
+      assertFalse(council.isOperationInProgress());
+
+      council.setOperationInProgress(true);
+      assertEquals(council.isOperationInProgress(), true);
+
+      council.setOperationInProgress(false);
+      assertFalse(council.isOperationInProgress());
     });
   });
 });
