@@ -267,7 +267,7 @@ async function showMemberProfile(member: Member): Promise<void> {
 }
 
 /**
- * Show paginated message history (reverse chronological - newest first)
+ * Show message history (reverse chronological - newest first)
  */
 async function showMessageHistory(
   db: CouncilDB,
@@ -275,43 +275,32 @@ async function showMessageHistory(
   id: string,
   name: string,
 ): Promise<void> {
-  const totalCount = await db.getHistoryCount(type, id);
+  // Fetch all messages (up to 100)
+  const result = await db.getMessageHistory(type, id, {
+    limit: 100,
+    reverse: true,
+  });
 
   // Empty case is handled by action menu disabling the option
-  if (totalCount === 0) {
+  if (result.items.length === 0) {
     return;
   }
 
-  // Show paginated list using cursor-based pagination
-  const PAGE_SIZE = 10;
-  let cursor: string | undefined;
-  let pageNum = 1;
-
-  // Store messages and their positions for viewing
-  const viewedMessages: ChatMessage[] = [];
+  const messages = result.items;
 
   while (true) {
     clearScreen();
 
-    // Fetch page (reverse=true by default in getMessageHistory - newest first)
-    const result = await db.getMessageHistory(type, id, {
-      limit: PAGE_SIZE,
-      cursor,
-      reverse: true,
-    });
-
     console.log("");
     console.log(
-      colors.bgCyan.bold(`  Message History: ${name} (${totalCount} total)  `),
+      colors.bgCyan.bold(
+        `  Message History: ${name} (${messages.length} total)  `,
+      ),
     );
     console.log("");
 
-    // Track messages for viewing
-    const startIdx = viewedMessages.length;
-    viewedMessages.push(...result.items);
-
     const options = [
-      ...result.items.map((msg, i) => {
+      ...messages.map((msg, i) => {
         const roleColor = msg.role === "system"
           ? colors.magenta
           : msg.role === "user"
@@ -322,17 +311,11 @@ async function showMessageHistory(
           name: `${roleColor(`[${msg.role}]`)} ${
             colors.dim(formatTimestamp(msg.timestamp))
           } ${preview}${msg.content.length > 60 ? "..." : ""}`,
-          value: `msg_${startIdx + i}`,
+          value: `msg_${i}`,
         };
       }),
-      ...(result.hasMore
-        ? [{ name: colors.cyan("Next page (older) ▶"), value: "__next__" }]
-        : []),
-      ...(cursor
-        ? [{ name: colors.cyan("◀ First page (newest)"), value: "__first__" }]
-        : []),
       {
-        name: colors.dim(`← Back (Page ${pageNum})`),
+        name: colors.dim("← Back"),
         value: "__back__",
       },
     ];
@@ -346,41 +329,35 @@ async function showMessageHistory(
       return;
     }
 
-    if (selected === "__first__") {
-      cursor = undefined;
-      pageNum = 1;
-      viewedMessages.length = 0;
-      continue;
-    }
-
-    if (selected === "__next__") {
-      cursor = result.cursor;
-      pageNum++;
-      continue;
-    }
-
     // View selected message
     const msgIndex = parseInt(selected.replace("msg_", ""));
-    const msg = viewedMessages[msgIndex];
+    const msg = messages[msgIndex];
     if (msg) {
-      clearScreen();
-      console.log("");
-      console.log(
-        colors.bgCyan.bold(`  Message ${msgIndex + 1}/${totalCount}  `),
+      const roleColors: Record<string, (s: string) => string> = {
+        system: colors.magenta,
+        user: colors.blue,
+        assistant: colors.green,
+      };
+      const roleColor = roleColors[msg.role] || colors.yellow;
+
+      const lines: string[] = [];
+      lines.push("");
+      lines.push(
+        colors.bgCyan.bold(`  Message ${msgIndex + 1}/${messages.length}  `),
       );
-      console.log("");
-      console.log(
+      lines.push("");
+      lines.push(
         colors.bold("Timestamp: ") + formatTimestamp(msg.timestamp),
       );
-      console.log(colors.bold("Role: ") + msg.role);
-      console.log("");
-      console.log(colors.bold("Content:"));
-      console.log(msg.content);
-      console.log("");
-      await Input.prompt({
-        message: colors.dim("Press Enter to go back..."),
-        default: "",
-      });
+      lines.push(colors.bold("Role: ") + roleColor(msg.role));
+      lines.push("");
+      lines.push(colors.bold("Content:"));
+      lines.push(msg.content);
+      lines.push("");
+
+      await pager(lines.join("\n"), true);
+      resetConfig();
+      clearScreen();
     }
   }
 }

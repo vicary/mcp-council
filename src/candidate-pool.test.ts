@@ -230,6 +230,47 @@ describe("CandidatePool", () => {
       assertEquals(result.evictions.includes("cand_1"), false);
       assertEquals(result.survivors.includes("cand_1"), true);
     });
+
+    it("should queue concurrent practice rounds", async () => {
+      const state = await db.getCouncilState();
+      state.targetPoolSize = 2;
+      for (let i = 1; i <= 2; i++) {
+        await db.saveCandidate(createCandidate(`cand_${i}`, `Candidate ${i}`));
+        state.candidateIds.push(`cand_${i}`);
+      }
+      await db.saveCouncilState(state);
+
+      // Set up responses for multiple rounds (2 candidates = 2 proposals + 2 votes per round)
+      const responses: string[] = [];
+      // First round
+      responses.push(JSON.stringify({ content: "P1", reasoning: "r" }));
+      responses.push(JSON.stringify({ content: "P2", reasoning: "r" }));
+      responses.push(JSON.stringify({ vote: 1, reasoning: "v" }));
+      responses.push(JSON.stringify({ vote: 2, reasoning: "v" }));
+      // Second round (queued)
+      responses.push(JSON.stringify({ content: "P1-2", reasoning: "r" }));
+      responses.push(JSON.stringify({ content: "P2-2", reasoning: "r" }));
+      responses.push(JSON.stringify({ vote: 1, reasoning: "v" }));
+      responses.push(JSON.stringify({ vote: 2, reasoning: "v" }));
+      llm.setResponses(responses);
+
+      // Start first round (will complete)
+      const promise1 = pool.runPracticeRound("First query");
+      // Queue second round (while first is in progress)
+      const promise2 = pool.runPracticeRound("Second query");
+
+      const [result1, result2] = await Promise.all([promise1, promise2]);
+
+      // First round should complete normally
+      assertEquals(result1.proposals.length, 2);
+      // Second round should be queued (returns early with queue message)
+      assertEquals(result2.proposals.length, 0);
+      assertEquals(result2.errors.length, 1);
+      assertEquals(
+        result2.errors[0].includes("queued"),
+        true,
+      );
+    });
   });
 
   describe("replenishPool", () => {

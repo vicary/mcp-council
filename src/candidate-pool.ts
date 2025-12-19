@@ -38,6 +38,11 @@ export interface PracticeRoundResult {
 const NULLIFICATION_THRESHOLD = 0.75;
 
 export class CandidatePool {
+  /** Mutex to prevent concurrent practice rounds */
+  private practiceRoundInProgress = false;
+  /** Queue of pending practice round prompts */
+  private practiceRoundQueue: string[] = [];
+
   constructor(
     private db: CouncilDB,
     private llm: LLMProvider,
@@ -45,9 +50,49 @@ export class CandidatePool {
   ) {}
 
   /**
-   * Run practice round for candidates after council vote
+   * Queue a practice round for candidates after council vote.
+   * If a practice round is already in progress, the prompt is queued.
+   * Only the most recent queued prompt will be executed (others are dropped).
    */
   async runPracticeRound(prompt: string): Promise<PracticeRoundResult> {
+    // If already running, queue this prompt (replacing any previously queued)
+    if (this.practiceRoundInProgress) {
+      this.logger.operation(
+        "[PRACTICE] Practice round in progress, queuing prompt",
+      );
+      this.practiceRoundQueue = [prompt]; // Keep only the latest
+      return {
+        proposals: [],
+        votes: [],
+        evictions: [],
+        survivors: [],
+        errors: ["Practice round queued - another round in progress"],
+      };
+    }
+
+    this.practiceRoundInProgress = true;
+    try {
+      const result = await this.executePracticeRound(prompt);
+
+      // Process queued prompt if any
+      while (this.practiceRoundQueue.length > 0) {
+        const nextPrompt = this.practiceRoundQueue.shift()!;
+        this.logger.operation("[PRACTICE] Processing queued practice round");
+        await this.executePracticeRound(nextPrompt);
+      }
+
+      return result;
+    } finally {
+      this.practiceRoundInProgress = false;
+    }
+  }
+
+  /**
+   * Execute a single practice round (internal implementation)
+   */
+  private async executePracticeRound(
+    prompt: string,
+  ): Promise<PracticeRoundResult> {
     const state = await this.db.getCouncilState();
     const candidates = await this.db.getCandidatesByIds(state.candidateIds);
 

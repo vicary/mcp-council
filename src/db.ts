@@ -194,9 +194,23 @@ export class CouncilDB {
 
   async getMembersByIds(ids: string[]): Promise<Member[]> {
     if (ids.length === 0) return [];
-    const keys = ids.map((id) => ["members", id] as const);
-    const results = await this.kv.getMany<Member[]>(keys);
-    return results.map((r) => r.value).filter((m): m is Member => m !== null);
+
+    // Deno KV getMany has a limit of 10 keys, so batch the requests
+    const BATCH_SIZE = 10;
+    const results: Member[] = [];
+
+    for (let i = 0; i < ids.length; i += BATCH_SIZE) {
+      const batchIds = ids.slice(i, i + BATCH_SIZE);
+      const keys = batchIds.map((id) => ["members", id] as const);
+      const batchResults = await this.kv.getMany<Member[]>(keys);
+      for (const r of batchResults) {
+        if (r.value !== null) {
+          results.push(r.value);
+        }
+      }
+    }
+
+    return results;
   }
 
   async deleteMember(id: string): Promise<void> {
@@ -243,16 +257,28 @@ export class CouncilDB {
   async getAllCandidates(
     options?: ListOptions,
   ): Promise<PaginatedResult<Candidate>> {
-    return this.listWithPagination<Candidate>(["candidates"], options);
+    return await this.listWithPagination<Candidate>(["candidates"], options);
   }
 
   async getCandidatesByIds(ids: string[]): Promise<Candidate[]> {
     if (ids.length === 0) return [];
-    const keys = ids.map((id) => ["candidates", id] as const);
-    const results = await this.kv.getMany<Candidate[]>(keys);
-    return results.map((r) => r.value).filter((c): c is Candidate =>
-      c !== null
-    );
+
+    // Deno KV getMany has a limit of 10 keys, so batch the requests
+    const BATCH_SIZE = 10;
+    const results: Candidate[] = [];
+
+    for (let i = 0; i < ids.length; i += BATCH_SIZE) {
+      const batchIds = ids.slice(i, i + BATCH_SIZE);
+      const keys = batchIds.map((id) => ["candidates", id] as const);
+      const batchResults = await this.kv.getMany<Candidate[]>(keys);
+      for (const r of batchResults) {
+        if (r.value !== null) {
+          results.push(r.value);
+        }
+      }
+    }
+
+    return results;
   }
 
   async deleteCandidate(id: string): Promise<void> {
