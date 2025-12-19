@@ -68,7 +68,7 @@ describe("CouncilDB", () => {
       await db.saveMember(member1);
       await db.saveMember(member2);
 
-      const allMembers = await db.getAllMembers();
+      const { items: allMembers } = await db.getAllMembers();
       assertEquals(allMembers.length, 2);
     });
 
@@ -164,7 +164,7 @@ describe("CouncilDB", () => {
         });
       }
 
-      const allCandidates = await db.getAllCandidates();
+      const { items: allCandidates } = await db.getAllCandidates();
       assertEquals(allCandidates.length, 3);
     });
 
@@ -242,8 +242,8 @@ describe("CouncilDB", () => {
       await db.clear();
 
       // Verify
-      assertEquals((await db.getAllMembers()).length, 0);
-      assertEquals((await db.getAllCandidates()).length, 0);
+      assertEquals((await db.getAllMembers()).items.length, 0);
+      assertEquals((await db.getAllCandidates()).items.length, 0);
 
       const clearedState = await db.getCouncilState();
       assertEquals(clearedState.memberIds, []);
@@ -269,7 +269,7 @@ describe("CouncilDB", () => {
       await Promise.all(members.map((m) => db.saveMember(m)));
 
       // Verify all members were saved
-      const allMembers = await db.getAllMembers();
+      const { items: allMembers } = await db.getAllMembers();
       assertEquals(allMembers.length, 10);
 
       // Verify state is consistent
@@ -301,7 +301,7 @@ describe("CouncilDB", () => {
       await Promise.all(candidates.map((c) => db.saveCandidate(c)));
 
       // Verify all candidates were saved
-      const allCandidates = await db.getAllCandidates();
+      const { items: allCandidates } = await db.getAllCandidates();
       assertEquals(allCandidates.length, 10);
 
       // Verify state is consistent
@@ -329,7 +329,7 @@ describe("CouncilDB", () => {
       }
 
       // Verify they exist
-      assertEquals((await db.getAllMembers()).length, 5);
+      assertEquals((await db.getAllMembers()).items.length, 5);
 
       // Delete all concurrently
       await Promise.all(
@@ -337,7 +337,7 @@ describe("CouncilDB", () => {
       );
 
       // Verify all were deleted
-      const allMembers = await db.getAllMembers();
+      const { items: allMembers } = await db.getAllMembers();
       assertEquals(allMembers.length, 0);
 
       const state = await db.getCouncilState();
@@ -394,8 +394,8 @@ describe("CouncilDB", () => {
       await Promise.all(operations);
 
       // Verify final state
-      const members = await db.getAllMembers();
-      const candidates = await db.getAllCandidates();
+      const { items: members } = await db.getAllMembers();
+      const { items: candidates } = await db.getAllCandidates();
       const state = await db.getCouncilState();
 
       assertEquals(members.length, 3, "Should have 3 new members");

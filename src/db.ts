@@ -2,12 +2,32 @@
  * Database layer for persisting council state using Deno.Kv
  */
 
+import { monotonicUlid } from "@std/ulid";
 import type { ChatMessage } from "./llm.ts";
+
+/**
+ * Pagination options for list operations
+ */
+export interface ListOptions {
+  limit?: number;
+  reverse?: boolean;
+  cursor?: string;
+}
+
+/**
+ * Paginated result
+ */
+export interface PaginatedResult<T> {
+  items: T[];
+  cursor?: string;
+  hasMore: boolean;
+}
 
 /**
  * Persona definition for council members and candidates
  */
 export interface Persona {
+  model?: string;
   name: string;
   values: string[];
   traits: string[];
@@ -35,6 +55,8 @@ export interface Candidate {
   createdAt: number;
   fitness: number;
   chatHistory: ChatMessage[];
+  evictedAt?: number;
+  evictionReason?: string;
 }
 
 /**
@@ -46,6 +68,7 @@ export interface CouncilState {
   targetPoolSize: number;
   roundsSinceEviction: number;
   lastRemovalCauses: string[];
+  removalHistorySummary?: string;
 }
 
 export class CouncilDB {
@@ -113,15 +136,73 @@ export class CouncilDB {
     return res.value;
   }
 
-  async getAllMembers(): Promise<Member[]> {
-    const members: Member[] = [];
-    for await (const entry of this.kv.list<Member>({ prefix: ["members"] })) {
-      members.push(entry.value);
+  async getAllMembers(options?: ListOptions): Promise<PaginatedResult<Member>> {
+    return await this.listWithPagination<Member>(["members"], options);
+  }
+
+  /**
+   * Generic paginated list helper
+   */
+  private async listWithPagination<T>(
+    prefix: Deno.KvKey,
+    options?: ListOptions,
+  ): Promise<PaginatedResult<T>> {
+    const limit = options?.limit;
+    const reverse = options?.reverse ?? false;
+    const cursor = options?.cursor;
+
+    const items: T[] = [];
+    let lastKey: string | undefined;
+    let hasMore = false;
+
+    // Build selector based on cursor position
+    let selector: Deno.KvListSelector;
+    if (cursor) {
+      const cursorKey = [...prefix, cursor];
+      if (reverse) {
+        // For reverse, we want items with keys < cursor
+        selector = { prefix, end: cursorKey };
+      } else {
+        // For forward, we want items with keys > cursor
+        selector = { prefix, start: cursorKey };
+      }
+    } else {
+      selector = { prefix };
     }
-    return members;
+
+    for await (const entry of this.kv.list<T>(selector, { reverse })) {
+      // Skip the cursor key itself if present
+      if (cursor && entry.key[entry.key.length - 1] === cursor) {
+        continue;
+      }
+
+      if (limit && items.length >= limit) {
+        hasMore = true;
+        break;
+      }
+
+      items.push(entry.value);
+      lastKey = entry.key[entry.key.length - 1] as string;
+    }
+
+    return {
+      items,
+      cursor: hasMore ? lastKey : undefined,
+      hasMore,
+    };
+  }
+
+  async getMembersByIds(ids: string[]): Promise<Member[]> {
+    if (ids.length === 0) return [];
+    const keys = ids.map((id) => ["members", id] as const);
+    const results = await this.kv.getMany<Member[]>(keys);
+    return results.map((r) => r.value).filter((m): m is Member => m !== null);
   }
 
   async deleteMember(id: string): Promise<void> {
+    // Delete history first (multiple ULID-keyed entries)
+    await this.deleteHistory("member", id);
+
     for (let attempt = 0; attempt < CouncilDB.MAX_RETRIES; attempt++) {
       const { state, versionstamp } = await this.getCouncilStateWithVersion();
       state.memberIds = state.memberIds.filter((mid) => mid !== id);
@@ -159,17 +240,25 @@ export class CouncilDB {
     return res.value;
   }
 
-  async getAllCandidates(): Promise<Candidate[]> {
-    const candidates: Candidate[] = [];
-    for await (
-      const entry of this.kv.list<Candidate>({ prefix: ["candidates"] })
-    ) {
-      candidates.push(entry.value);
-    }
-    return candidates;
+  async getAllCandidates(
+    options?: ListOptions,
+  ): Promise<PaginatedResult<Candidate>> {
+    return this.listWithPagination<Candidate>(["candidates"], options);
+  }
+
+  async getCandidatesByIds(ids: string[]): Promise<Candidate[]> {
+    if (ids.length === 0) return [];
+    const keys = ids.map((id) => ["candidates", id] as const);
+    const results = await this.kv.getMany<Candidate[]>(keys);
+    return results.map((r) => r.value).filter((c): c is Candidate =>
+      c !== null
+    );
   }
 
   async deleteCandidate(id: string): Promise<void> {
+    // Delete history first (multiple ULID-keyed entries)
+    await this.deleteHistory("candidate", id);
+
     for (let attempt = 0; attempt < CouncilDB.MAX_RETRIES; attempt++) {
       const { state, versionstamp } = await this.getCouncilStateWithVersion();
       state.candidateIds = state.candidateIds.filter((cid) => cid !== id);
@@ -182,6 +271,227 @@ export class CouncilDB {
       await this.retryDelay(attempt);
     }
     throw new Error("Failed to delete candidate after max retries");
+  }
+
+  /**
+   * Evict a candidate (mark as evicted instead of deleting)
+   */
+  async evictCandidate(id: string, reason: string): Promise<void> {
+    const candidate = await this.getCandidate(id);
+    if (!candidate) return;
+
+    candidate.evictedAt = Date.now();
+    candidate.evictionReason = reason;
+
+    for (let attempt = 0; attempt < CouncilDB.MAX_RETRIES; attempt++) {
+      const { state, versionstamp } = await this.getCouncilStateWithVersion();
+      state.candidateIds = state.candidateIds.filter((cid) => cid !== id);
+      const result = await this.kv.atomic()
+        .check({ key: ["state"], versionstamp })
+        .delete(["candidates", id])
+        .set(["evicted", id], candidate)
+        .set(["state"], state)
+        .commit();
+      if (result.ok) return;
+      await this.retryDelay(attempt);
+    }
+    throw new Error("Failed to evict candidate after max retries");
+  }
+
+  /**
+   * Get all evicted candidates (paginated)
+   */
+  async getAllEvictedCandidates(
+    options?: ListOptions,
+  ): Promise<PaginatedResult<Candidate>> {
+    return this.listWithPagination<Candidate>(["evicted"], options);
+  }
+
+  /**
+   * Get a specific evicted candidate
+   */
+  async getEvictedCandidate(id: string): Promise<Candidate | null> {
+    const res = await this.kv.get<Candidate>(["evicted", id]);
+    return res.value;
+  }
+
+  /**
+   * Delete an evicted candidate permanently
+   */
+  async deleteEvictedCandidate(id: string): Promise<void> {
+    // Delete all history entries for this candidate
+    await this.deleteHistory("candidate", id);
+    await this.kv.delete(["evicted", id]);
+  }
+
+  // Message history operations (separate storage for TUI review)
+  // Messages are stored as: ["history", type, id, ulid] -> ChatMessage
+  // This allows efficient pagination and reverse ordering with Kv.list()
+  private static readonly MAX_HISTORY_MESSAGES = 100;
+
+  /**
+   * Append a message to the history
+   * Messages are stored with ULID keys for sortable, paginated access
+   */
+  async appendToHistory(
+    type: "member" | "candidate",
+    id: string,
+    message: ChatMessage,
+  ): Promise<void> {
+    const msgId = monotonicUlid();
+    const key = ["history", type, id, msgId];
+    await this.kv.set(key, message);
+
+    // Trim old messages if over limit
+    await this.trimHistory(type, id);
+  }
+
+  /**
+   * Append multiple messages to history
+   */
+  async appendManyToHistory(
+    type: "member" | "candidate",
+    id: string,
+    messages: ChatMessage[],
+  ): Promise<void> {
+    if (messages.length === 0) return;
+
+    // Use atomic batch for efficiency
+    let atomic = this.kv.atomic();
+    for (const message of messages) {
+      const msgId = monotonicUlid();
+      const key = ["history", type, id, msgId];
+      atomic = atomic.set(key, message);
+    }
+    await atomic.commit();
+
+    // Trim old messages if over limit
+    await this.trimHistory(type, id);
+  }
+
+  /**
+   * Trim history to keep only last MAX_HISTORY_MESSAGES
+   */
+  private async trimHistory(
+    type: "member" | "candidate",
+    id: string,
+  ): Promise<void> {
+    const prefix = ["history", type, id];
+    const allKeys: Deno.KvKey[] = [];
+
+    // Collect all keys (oldest first, since ULIDs are lexicographically sorted)
+    for await (const entry of this.kv.list({ prefix })) {
+      allKeys.push(entry.key);
+    }
+
+    // Delete oldest entries if over limit
+    const excess = allKeys.length - CouncilDB.MAX_HISTORY_MESSAGES;
+    if (excess > 0) {
+      const keysToDelete = allKeys.slice(0, excess);
+      let atomic = this.kv.atomic();
+      for (const key of keysToDelete) {
+        atomic = atomic.delete(key);
+      }
+      await atomic.commit();
+    }
+  }
+
+  /**
+   * Get message history for TUI review (paginated)
+   * Returns messages in reverse chronological order by default (newest first)
+   */
+  async getMessageHistory(
+    type: "member" | "candidate",
+    id: string,
+    options?: ListOptions,
+  ): Promise<PaginatedResult<ChatMessage>> {
+    const prefix: Deno.KvKey = ["history", type, id];
+    // Default to reverse order (newest first)
+    const reverse = options?.reverse ?? true;
+    const limit = options?.limit;
+    const cursor = options?.cursor;
+
+    const items: ChatMessage[] = [];
+    let lastKey: string | undefined;
+    let hasMore = false;
+
+    // Build selector based on cursor position
+    let selector: Deno.KvListSelector;
+    if (cursor) {
+      const cursorKey = [...prefix, cursor];
+      if (reverse) {
+        selector = { prefix, end: cursorKey };
+      } else {
+        selector = { prefix, start: cursorKey };
+      }
+    } else {
+      selector = { prefix };
+    }
+
+    for await (
+      const entry of this.kv.list<ChatMessage>(selector, { reverse })
+    ) {
+      // Skip the cursor key itself if present
+      const keyId = entry.key[entry.key.length - 1] as string;
+      if (cursor && keyId === cursor) {
+        continue;
+      }
+
+      if (limit && items.length >= limit) {
+        hasMore = true;
+        break;
+      }
+
+      items.push(entry.value);
+      lastKey = keyId;
+    }
+
+    return {
+      items,
+      cursor: hasMore ? lastKey : undefined,
+      hasMore,
+    };
+  }
+
+  /**
+   * Get total count of history messages
+   */
+  async getHistoryCount(
+    type: "member" | "candidate",
+    id: string,
+  ): Promise<number> {
+    const prefix = ["history", type, id];
+    let count = 0;
+    for await (const _ of this.kv.list({ prefix })) {
+      count++;
+    }
+    return count;
+  }
+
+  /**
+   * Delete all history for a member or candidate
+   */
+  private async deleteHistory(
+    type: "member" | "candidate",
+    id: string,
+  ): Promise<void> {
+    const prefix = ["history", type, id];
+    const keysToDelete: Deno.KvKey[] = [];
+
+    for await (const entry of this.kv.list({ prefix })) {
+      keysToDelete.push(entry.key);
+    }
+
+    // Delete in batches of 10 (atomic operation limit)
+    const batchSize = 10;
+    for (let i = 0; i < keysToDelete.length; i += batchSize) {
+      const batch = keysToDelete.slice(i, i + batchSize);
+      let atomic = this.kv.atomic();
+      for (const key of batch) {
+        atomic = atomic.delete(key);
+      }
+      await atomic.commit();
+    }
   }
 
   // Council state operations
@@ -207,6 +517,16 @@ export class CouncilDB {
     await this.kv.set(["state"], state);
   }
 
+  async saveMembers(members: Member[]): Promise<void> {
+    if (members.length === 0) return;
+    await Promise.all(members.map((m) => this.saveMember(m)));
+  }
+
+  async saveCandidates(candidates: Candidate[]): Promise<void> {
+    if (candidates.length === 0) return;
+    await Promise.all(candidates.map((c) => this.saveCandidate(c)));
+  }
+
   // Utility
   close(): void {
     if (this.closed) return;
@@ -222,6 +542,16 @@ export class CouncilDB {
 
     // Delete all candidates
     for await (const entry of this.kv.list({ prefix: ["candidates"] })) {
+      await this.kv.delete(entry.key);
+    }
+
+    // Delete all evicted candidates
+    for await (const entry of this.kv.list({ prefix: ["evicted"] })) {
+      await this.kv.delete(entry.key);
+    }
+
+    // Delete all message histories
+    for await (const entry of this.kv.list({ prefix: ["history"] })) {
       await this.kv.delete(entry.key);
     }
 

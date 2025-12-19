@@ -16,7 +16,7 @@ describe("MockLLMProvider", () => {
         { role: "user", content: "Hi", timestamp: Date.now() },
       ];
 
-      const result = await llm.complete(messages);
+      const result = await llm.text(messages);
       assertEquals(result, "Hello, world!");
     });
 
@@ -28,9 +28,9 @@ describe("MockLLMProvider", () => {
         { role: "user", content: "test", timestamp: Date.now() },
       ];
 
-      assertEquals(await llm.complete(messages), "First");
-      assertEquals(await llm.complete(messages), "Second");
-      assertEquals(await llm.complete(messages), "Third");
+      assertEquals(await llm.text(messages), "First");
+      assertEquals(await llm.text(messages), "Second");
+      assertEquals(await llm.text(messages), "Third");
     });
 
     it("should return default response when exhausted", async () => {
@@ -41,8 +41,8 @@ describe("MockLLMProvider", () => {
         { role: "user", content: "test", timestamp: Date.now() },
       ];
 
-      await llm.complete(messages); // Use up the response
-      const result = await llm.complete(messages);
+      await llm.text(messages); // Use up the response
+      const result = await llm.text(messages);
       assertEquals(result, "Mock response");
     });
 
@@ -54,7 +54,7 @@ describe("MockLLMProvider", () => {
         { role: "user", content: "test", timestamp: Date.now() },
       ];
 
-      const result = await llm.complete(messages);
+      const result = await llm.text(messages);
       assertEquals(result, "Pushed response");
     });
   });
@@ -68,7 +68,7 @@ describe("MockLLMProvider", () => {
         { role: "user", content: "test", timestamp: Date.now() },
       ];
 
-      const result = await llm.completeJSON<{ name: string; value: number }>(
+      const result = await llm.json<{ name: string; value: number }>(
         messages,
         "",
       );
@@ -85,7 +85,7 @@ describe("MockLLMProvider", () => {
       ];
 
       await assertRejects(
-        () => llm.completeJSON(messages, ""),
+        () => llm.json(messages, ""),
         Error,
         "No mock response available",
       );
@@ -99,7 +99,7 @@ describe("MockLLMProvider", () => {
         { role: "user", content: "test", timestamp: Date.now() },
       ];
 
-      await assertRejects(() => llm.completeJSON(messages, ""), SyntaxError);
+      await assertRejects(() => llm.json(messages, ""), SyntaxError);
     });
   });
 });

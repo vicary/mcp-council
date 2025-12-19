@@ -243,7 +243,12 @@ ${candidateList}
 ## Statistics
 - Rounds since last eviction: ${status.state.roundsSinceEviction}
 - Target pool size: ${status.state.targetPoolSize}
-- Recent removal causes: ${status.state.lastRemovalCauses.length}`;
+- Recent removal causes: ${status.state.lastRemovalCauses.length}
+${
+        status.state.removalHistorySummary
+          ? `\n## Removal History Summary\n${status.state.removalHistorySummary}`
+          : ""
+      }`;
 
       return {
         content: [

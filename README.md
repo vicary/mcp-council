@@ -1,7 +1,33 @@
 # AI Council MCP Server
 
-An 8-member AI council exposed as an MCP server. TypeScript + Deno, persisted to
-SQLite.
+## Why?
+
+Pewdiepie did it, wanna try it out too.
+
+The whole project comes from vibe coding, almost didn't touch a line of code.
+
+## What?
+
+An MCP server that provides AI council deliberation — multiple AI personas
+discuss your prompt, propose solutions, and vote to select the best response.
+
+Think of it as a "jury of AIs" for more thoughtful, considered answers.
+
+## How?
+
+Each vote triggers a 3-round deliberation:
+
+1. **Propose** — Each council member drafts a response based on their persona
+2. **Vote** — Members vote for their favorite proposal (no self-voting); winner
+   gets executed
+3. **Evict** — Members can nominate underperformers; supermajority (6/8) removes
+   them
+
+Evicted members demote to the candidate pool, triggering a promotion vote.
+Candidates also run practice rounds to compete for council seats.
+
+The system is self-improving: personas evolve, weak members get replaced, and
+the candidate pool dynamically sizes based on council stability.
 
 ## Quick Start
 
@@ -14,9 +40,7 @@ SQLite.
 
 ```bash
 export OPENAI_API_KEY="your-api-key"
-# Optional: customize endpoint and model
 export OPENAI_BASE_URL="https://api.openai.com/v1"
-export OPENAI_MODEL="gpt-4o-mini"
 ```
 
 ### Running in Development
@@ -53,17 +77,16 @@ This creates a standalone `mcp-council` executable that can be run without Deno:
 
 ### VS Code (Copilot)
 
-Add to your `settings.json`:
+Add to your `mcp.json`:
 
 ```json
 {
-  "mcp": {
-    "servers": {
-      "council": {
-        "command": "/path/to/mcp-council",
-        "env": {
-          "OPENAI_API_KEY": "your-api-key"
-        }
+  "servers": {
+    "mcp-council": {
+      "command": "deno",
+      "args": ["run", "-A", "jsr:@vicary/mcp-council"],
+      "env": {
+        "OPENAI_API_KEY": "your-api-key"
       }
     }
   }
@@ -77,24 +100,9 @@ Add to your `claude_desktop_config.json`:
 ```json
 {
   "mcpServers": {
-    "council": {
-      "command": "/path/to/mcp-council",
-      "env": {
-        "OPENAI_API_KEY": "your-api-key"
-      }
-    }
-  }
-}
-```
-
-### Using with `deno run` (without compiling)
-
-```json
-{
-  "mcpServers": {
-    "council": {
+    "mcp-council": {
       "command": "deno",
-      "args": ["run", "--allow-all", "/path/to/mcp-council/src/main.ts"],
+      "args": ["run", "-A", "jsr:@vicary/mcp-council"],
       "env": {
         "OPENAI_API_KEY": "your-api-key"
       }
@@ -206,40 +214,6 @@ You can also test by piping JSON-RPC messages directly:
 
 ```bash
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | deno run --allow-all src/main.ts
-```
-
-## Project Structure
-
-```
-mcp-council/
-├── src/
-│   ├── main.ts           # Entry point
-│   ├── server.ts         # MCP server implementation
-│   ├── db.ts             # Deno.Kv persistence layer + domain types
-│   ├── llm.ts            # LLM provider abstraction
-│   ├── orchestrator.ts   # Voting flow management
-│   ├── council.ts        # Council lifecycle
-│   ├── candidate-pool.ts # Candidate management
-│   ├── persona.ts        # Persona generation
-│   └── utils/
-│       ├── id.ts         # ID generation
-│       └── summarize.ts  # Context summarization
-├── tests/
-│   ├── db.test.ts
-│   ├── llm.test.ts
-│   ├── persona.test.ts
-│   ├── orchestrator.test.ts
-│   ├── candidate-pool.test.ts
-│   ├── council.test.ts
-│   ├── server.test.ts
-│   ├── integration.test.ts
-│   └── utils/
-│       ├── id.test.ts
-│       └── summarize.test.ts
-├── deno.json             # Deno configuration
-├── Epic.md               # Feature specification
-├── TechnicalGuideline.md # Coding guidelines
-└── README.md             # This file
 ```
 
 ## License

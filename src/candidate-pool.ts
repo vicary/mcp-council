@@ -2,20 +2,26 @@
  * Candidate pool management - practice rounds, creation, eviction
  */
 
+import { monotonicUlid } from "@std/ulid";
 import type { Candidate, CouncilDB, CouncilState } from "./db.ts";
 import type { ChatMessage, LLMProvider } from "./llm.ts";
 import type { Proposal, Vote } from "./orchestrator.ts";
 import {
   buildCandidateIntro,
+  buildProposalPrompt,
   buildSystemPrompt,
+  buildVotePrompt,
   generatePersona,
 } from "./persona.ts";
-import { generateId } from "./utils/id.ts";
 import { defaultLogger, type Logger } from "./utils/logger.ts";
 import {
   resilientParallel,
   type RetryExhaustedError,
 } from "./utils/resilient.ts";
+import {
+  CANDIDATE_SUMMARIZE_THRESHOLD,
+  summarizeRemovalCauses,
+} from "./utils/summarize.ts";
 
 /**
  * Result of a candidate practice round
@@ -43,11 +49,7 @@ export class CandidatePool {
    */
   async runPracticeRound(prompt: string): Promise<PracticeRoundResult> {
     const state = await this.db.getCouncilState();
-    const candidates: Candidate[] = [];
-    for (const id of state.candidateIds) {
-      const candidate = await this.db.getCandidate(id);
-      if (candidate) candidates.push(candidate);
-    }
+    const candidates = await this.db.getCandidatesByIds(state.candidateIds);
 
     if (candidates.length < 2) {
       return {
@@ -90,8 +92,8 @@ export class CandidatePool {
     // Update fitness based on votes received
     for (const candidate of candidates) {
       candidate.fitness += voteCounts.get(candidate.id) || 0;
-      await this.db.saveCandidate(candidate);
     }
+    await this.db.saveCandidates(candidates);
 
     // Eviction vote (with retry)
     const { evictions, errors: evictionErrors } = await this.processEvictions(
@@ -123,17 +125,7 @@ export class CandidatePool {
     candidates: Candidate[],
     prompt: string,
   ): Promise<{ proposals: Proposal[]; errors: RetryExhaustedError[] }> {
-    const userContent = `Practice round query: "${prompt}"
-
-Propose a response aligned with your values. This is practice for potential council promotion.
-CRITICAL: Your proposal should offer a DISTINCT perspective from what others might propose. Avoid generic responses.
-Focus on being "divergent yet considerate" - offer a unique angle while respecting the complexity of the issue.
-
-Respond in JSON format:
-{
-  "content": "your proposed response",
-  "reasoning": "why this response aligns with your values and offers a unique perspective"
-}`;
+    const userContent = buildProposalPrompt(prompt, true);
 
     const operations = candidates.map((candidate) => ({
       label: `practice proposal from ${candidate.persona.name}`,
@@ -152,22 +144,59 @@ Respond in JSON format:
           },
         ];
 
-        const response = await this.llm.completeJSON<{
+        const response = await this.llm.json<{
           content: string;
           reasoning: string;
-        }>(messages, "");
+        }>(messages, "", candidate.persona.model);
 
         // Save the prompt and response to chat history
-        candidate.chatHistory.push({
+        const userMsg: ChatMessage = {
           role: "user",
           content: userContent,
           timestamp: Date.now(),
-        });
-        candidate.chatHistory.push({
+        };
+        const assistantMsg: ChatMessage = {
           role: "assistant",
           content: JSON.stringify(response),
           timestamp: Date.now(),
-        });
+        };
+        candidate.chatHistory.push(userMsg, assistantMsg);
+
+        // Also save to separate history storage for TUI review
+        await this.db.appendManyToHistory("candidate", candidate.id, [
+          userMsg,
+          assistantMsg,
+        ]);
+
+        // Summarize active context if needed
+        if (candidate.chatHistory.length > CANDIDATE_SUMMARIZE_THRESHOLD) {
+          candidate.chatHistory = await this.llm.text(
+            [
+              {
+                role: "system",
+                content:
+                  "Summarize the following conversation history concisely, preserving key decisions, votes, and context.",
+                timestamp: Date.now(),
+              },
+              {
+                role: "user",
+                content: candidate.chatHistory
+                  .map((m) => `${m.role}: ${m.content}`)
+                  .join("\n"),
+                timestamp: Date.now(),
+              },
+            ],
+            candidate.persona.model,
+          ).then((summary) => [
+            {
+              role: "system" as const,
+              content: `[Previous history summary]: ${summary}`,
+              timestamp: Date.now(),
+            },
+            ...candidate.chatHistory.slice(-3),
+          ]);
+        }
+
         await this.db.saveCandidate(candidate);
 
         return {
@@ -186,7 +215,15 @@ Respond in JSON format:
     candidates: Candidate[],
     proposals: Proposal[],
   ): Promise<{ votes: Vote[]; errors: RetryExhaustedError[] }> {
-    const operations = candidates.map((candidate, index) => ({
+    // Pre-build proposal summary for all votes
+    const proposalSummary = proposals
+      .map((p, i) =>
+        `Proposal ${i + 1}:\n${p.content}\nReasoning: ${p.reasoning}`
+      )
+      .join("\n\n");
+    const votePrompt = buildVotePrompt(proposalSummary);
+
+    const operations = candidates.map((candidate) => ({
       label: `practice vote from ${candidate.persona.name}`,
       fn: async (): Promise<Vote> => {
         const otherProposals = proposals.filter(
@@ -201,10 +238,6 @@ Respond in JSON format:
           };
         }
 
-        const proposalText = otherProposals
-          .map((p, i) => `${i + 1}. ${p.content}\nReasoning: ${p.reasoning}`)
-          .join("\n\n");
-
         const messages: ChatMessage[] = [
           {
             role: "system",
@@ -213,33 +246,15 @@ Respond in JSON format:
           },
           {
             role: "user",
-            content:
-              `Vote for the proposal that offers the most VALUABLE perspective, even if it differs from your own (excluding your own #${
-                index + 1
-              }):
-
-${proposalText}
-
-Criteria for voting:
-1. Does the proposal offer a unique/divergent insight?
-2. Is the reasoning sound and considerate?
-3. Does it advance the discussion constructively?
-
-Do not simply vote for the most popular or "safe" option. Value diversity of thought.
-
-Respond in JSON format:
-{
-  "vote": <proposal number or null to abstain>,
-  "reasoning": "why you chose this based on the criteria"
-}`,
+            content: votePrompt,
             timestamp: Date.now(),
           },
         ];
 
-        const response = await this.llm.completeJSON<{
+        const response = await this.llm.json<{
           vote: number | null;
           reasoning: string;
-        }>(messages, "");
+        }>(messages, "", candidate.persona.model);
 
         const votedProposal = response.vote !== null
           ? otherProposals[response.vote - 1]
@@ -305,10 +320,10 @@ Respond in JSON format:
           },
         ];
 
-        const response = await this.llm.completeJSON<{
+        const response = await this.llm.json<{
           nominee: number | null;
           reasoning: string;
-        }>(messages, "");
+        }>(messages, "", candidate.persona.model);
 
         return {
           nominatorId: candidate.id,
@@ -348,20 +363,33 @@ Respond in JSON format:
 
         evicted.push(candidateId);
 
+        // Collect reasons from nominations
+        const reasons = nominations
+          .filter((n) => n.nomineeId === candidateId)
+          .map((n) => n.reasoning)
+          .join("; ");
+
         // Record cause
         const cause =
-          `Candidate evicted by majority (${count}/${candidates.length})`;
+          `Candidate evicted by majority (${count}/${candidates.length}): ${reasons}`;
         state.lastRemovalCauses = [
           cause,
           ...state.lastRemovalCauses.slice(0, 9),
         ];
 
-        // Delete from DB
-        await this.db.deleteCandidate(candidateId);
+        // Evict candidate (mark as evicted, don't delete permanently)
+        await this.db.evictCandidate(candidateId, reasons);
         state.candidateIds = state.candidateIds.filter(
           (id) => id !== candidateId,
         );
       }
+    }
+
+    if (evicted.length > 0) {
+      state.removalHistorySummary = await summarizeRemovalCauses(
+        state.lastRemovalCauses,
+        this.llm,
+      );
     }
 
     // Create new candidates if below target
@@ -372,12 +400,15 @@ Respond in JSON format:
   }
 
   private async updateSurvivorPersonas(survivorIds: string[]): Promise<void> {
-    for (const id of survivorIds) {
-      const candidate = await this.db.getCandidate(id);
-      if (!candidate) continue;
+    const candidates = await this.db.getCandidatesByIds(survivorIds);
 
-      // Random chance to evolve persona
-      if (Math.random() < 0.3) {
+    // Filter candidates that will evolve (30% chance)
+    const candidatesToEvolve = candidates.filter(() => Math.random() < 0.3);
+    if (candidatesToEvolve.length === 0) return;
+
+    // Run all persona refinement LLM calls in parallel
+    const refinementResults = await Promise.allSettled(
+      candidatesToEvolve.map(async (candidate) => {
         const messages: ChatMessage[] = [
           {
             role: "system",
@@ -400,26 +431,36 @@ Would you like to refine any aspect? Respond in JSON:
           },
         ];
 
-        try {
-          const response = await this.llm.completeJSON<{
-            refined: boolean;
-            newValues?: string[];
-            newTraits?: string[];
-          }>(messages, "");
+        const response = await this.llm.json<{
+          refined: boolean;
+          newValues?: string[];
+          newTraits?: string[];
+        }>(messages, "", candidate.persona.model);
 
-          if (response.refined) {
-            if (response.newValues) {
-              candidate.persona.values = response.newValues;
-            }
-            if (response.newTraits) {
-              candidate.persona.traits = response.newTraits;
-            }
-            await this.db.saveCandidate(candidate);
+        if (response.refined) {
+          if (response.newValues) {
+            candidate.persona.values = response.newValues;
           }
-        } catch {
-          // Ignore refinement failures
+          if (response.newTraits) {
+            candidate.persona.traits = response.newTraits;
+          }
+          return candidate;
         }
-      }
+        return null;
+      }),
+    );
+
+    // Collect successfully refined candidates
+    const refinedCandidates = refinementResults
+      .filter((r): r is PromiseFulfilledResult<Candidate | null> =>
+        r.status === "fulfilled"
+      )
+      .map((r) => r.value)
+      .filter((c): c is Candidate => c !== null);
+
+    // Batch save all refined candidates
+    if (refinedCandidates.length > 0) {
+      await this.db.saveCandidates(refinedCandidates);
     }
   }
 
@@ -436,20 +477,16 @@ Would you like to refine any aspect? Respond in JSON:
    * Create a new candidate with generated persona
    */
   async createCandidate(state: CouncilState): Promise<Candidate> {
-    // Get all existing personas
-    const members: Candidate["persona"][] = [];
-    for (const id of state.memberIds) {
-      const member = await this.db.getMember(id);
-      if (member) members.push(member.persona);
-    }
+    // Get all existing personas in parallel
+    const [members, candidateList] = await Promise.all([
+      this.db.getMembersByIds(state.memberIds),
+      this.db.getCandidatesByIds(state.candidateIds),
+    ]);
 
-    const candidatePersonas: Candidate["persona"][] = [];
-    for (const id of state.candidateIds) {
-      const candidate = await this.db.getCandidate(id);
-      if (candidate) candidatePersonas.push(candidate.persona);
-    }
-
-    const existingPersonas = [...members, ...candidatePersonas];
+    const existingPersonas = [
+      ...members.map((m) => m.persona),
+      ...candidateList.map((c) => c.persona),
+    ];
 
     // Get last eviction cause for context
     const lastCause = state.lastRemovalCauses[0];
@@ -462,7 +499,7 @@ Would you like to refine any aspect? Respond in JSON:
     );
 
     const candidate: Candidate = {
-      id: generateId(),
+      id: monotonicUlid(),
       persona,
       createdAt: Date.now(),
       fitness: 0,

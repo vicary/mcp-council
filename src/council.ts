@@ -2,11 +2,11 @@
  * Council bootstrap and lifecycle management
  */
 
+import { monotonicUlid } from "@std/ulid";
 import { CandidatePool } from "./candidate-pool.ts";
 import type { Candidate, CouncilDB, CouncilState, Member } from "./db.ts";
 import type { LLMProvider } from "./llm.ts";
 import { buildCouncilIntro } from "./persona.ts";
-import { generateId } from "./utils/id.ts";
 import { defaultLogger, type Logger } from "./utils/logger.ts";
 
 const COUNCIL_SIZE = 8;
@@ -149,18 +149,18 @@ export class Council {
     try {
       const state = await this.db.getCouncilState();
 
-      // Restore existing members and candidates from DB
-      const existingMembers = await this.db.getAllMembers();
-      const existingCandidates = await this.db.getAllCandidates();
+      {
+        const { items: members } = await this.db.getAllMembers();
+        state.memberIds = members.map((m) => m.id);
+      }
 
-      // Sync state with actual DB contents
-      state.memberIds = existingMembers.map((m) => m.id);
-      state.candidateIds = existingCandidates.map((c) => c.id);
+      {
+        const { items: candidates } = await this.db.getAllCandidates();
+        state.candidateIds = candidates.map((c) => c.id);
+      }
 
       // Ensure target pool size is set
-      if (state.targetPoolSize === 0) {
-        state.targetPoolSize = INITIAL_POOL_SIZE;
-      }
+      state.targetPoolSize ||= INITIAL_POOL_SIZE;
 
       // If council is not full, try to create one candidate per check
       // This spreads the load across multiple recovery cycles
@@ -217,7 +217,7 @@ export class Council {
 
       // Convert to member
       const member: Member = {
-        id: generateId(),
+        id: monotonicUlid(),
         persona: candidate.persona,
         createdAt: candidate.createdAt,
         promotedAt: Date.now(),
@@ -254,18 +254,10 @@ export class Council {
     state: CouncilState;
   }> {
     const state = await this.db.getCouncilState();
-    const members: Member[] = [];
-    const candidates: Candidate[] = [];
-
-    for (const id of state.memberIds) {
-      const member = await this.db.getMember(id);
-      if (member) members.push(member);
-    }
-
-    for (const id of state.candidateIds) {
-      const candidate = await this.db.getCandidate(id);
-      if (candidate) candidates.push(candidate);
-    }
+    const [members, candidates] = await Promise.all([
+      this.db.getMembersByIds(state.memberIds),
+      this.db.getCandidatesByIds(state.candidateIds),
+    ]);
 
     return { members, candidates, state };
   }

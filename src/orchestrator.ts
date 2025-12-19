@@ -4,13 +4,24 @@
 
 import type { Candidate, CouncilDB, CouncilState, Member } from "./db.ts";
 import type { ChatMessage, LLMProvider } from "./llm.ts";
-import { buildDemotionNotice, buildSystemPrompt } from "./persona.ts";
+import {
+  buildDemotionNotice,
+  buildEvictionPrompt,
+  buildProposalPrompt,
+  buildSystemPrompt,
+  buildVotePrompt,
+} from "./persona.ts";
 import { defaultLogger, type Logger } from "./utils/logger.ts";
 import {
   resilientParallel,
   type RetryExhaustedError,
 } from "./utils/resilient.ts";
-import { anonymizeSummary, summarizeHistory } from "./utils/summarize.ts";
+import {
+  anonymizeSummary,
+  MEMBER_SUMMARIZE_THRESHOLD,
+  summarizeHistory,
+  summarizeRemovalCauses,
+} from "./utils/summarize.ts";
 
 /**
  * Proposal from a council member
@@ -98,11 +109,7 @@ export class Orchestrator {
     callbacks?: VoteProgressCallbacks,
   ): Promise<VoteResult> {
     const state = await this.db.getCouncilState();
-    const members: Member[] = [];
-    for (const id of state.memberIds) {
-      const member = await this.db.getMember(id);
-      if (member) members.push(member);
-    }
+    const members = await this.db.getMembersByIds(state.memberIds);
 
     // Collect errors throughout the voting process
     const allErrors: RetryExhaustedError[] = [];
@@ -171,17 +178,7 @@ export class Orchestrator {
     members: Member[],
     prompt: string,
   ): Promise<{ proposals: Proposal[]; errors: RetryExhaustedError[] }> {
-    const userContent = `A query has been submitted to the council: "${prompt}"
-
-Propose a response that aligns with your values and perspective.
-CRITICAL: Your proposal should offer a DISTINCT perspective from what others might propose. Avoid generic responses.
-Focus on being "divergent yet considerate" - offer a unique angle while respecting the complexity of the issue.
-
-Respond in JSON format:
-{
-  "content": "your proposed response",
-  "reasoning": "why this response aligns with your values and offers a unique perspective"
-}`;
+    const userContent = buildProposalPrompt(prompt);
 
     const operations = members.map((member) => ({
       label: `proposal from ${member.persona.name}`,
@@ -200,22 +197,29 @@ Respond in JSON format:
           },
         ];
 
-        const response = await this.llm.completeJSON<{
+        const response = await this.llm.json<{
           content: string;
           reasoning: string;
-        }>(messages, "");
+        }>(messages, "", member.persona.model);
 
         // Save the prompt and response to chat history
-        member.chatHistory.push({
+        const userMsg: ChatMessage = {
           role: "user",
           content: userContent,
           timestamp: Date.now(),
-        });
-        member.chatHistory.push({
+        };
+        const assistantMsg: ChatMessage = {
           role: "assistant",
           content: JSON.stringify(response),
           timestamp: Date.now(),
-        });
+        };
+        member.chatHistory.push(userMsg, assistantMsg);
+
+        // Also save to separate history storage for TUI review
+        await this.db.appendManyToHistory("member", member.id, [
+          userMsg,
+          assistantMsg,
+        ]);
 
         return {
           memberId: member.id,
@@ -250,7 +254,9 @@ Respond in JSON format:
       )
       .join("\n\n");
 
-    const operations = members.map((member, memberIndex) => ({
+    const votePrompt = buildVotePrompt(proposalSummary);
+
+    const operations = members.map((member) => ({
       label: `vote from ${member.persona.name}`,
       fn: async (): Promise<Vote> => {
         const otherProposals = proposals
@@ -273,32 +279,15 @@ Respond in JSON format:
           },
           {
             role: "user",
-            content:
-              `Review these proposals and vote for the one that offers the most VALUABLE perspective, even if it differs from your own.
-
-${proposalSummary}
-
-Criteria for voting:
-1. Does the proposal offer a unique/divergent insight?
-2. Is the reasoning sound and considerate?
-3. Does it advance the discussion constructively?
-
-Do not simply vote for the most popular or "safe" option. Value diversity of thought.
-You may abstain if none meet these standards.
-
-Respond in JSON format:
-{
-  "vote": <proposal number or null to abstain>,
-  "reasoning": "why you chose this proposal based on the criteria"
-}`,
+            content: votePrompt,
             timestamp: Date.now(),
           },
         ];
 
-        const response = await this.llm.completeJSON<{
+        const response = await this.llm.json<{
           vote: number | null;
           reasoning: string;
-        }>(messages, "");
+        }>(messages, "", member.persona.model);
 
         const votedProposal = response.vote !== null
           ? proposals[response.vote - 1]
@@ -321,47 +310,66 @@ Respond in JSON format:
       operations,
     );
 
-    // Tally votes
+    // Tally votes and find winner(s) in single pass
+    const { winner, tieBreak } = await this.tallyVotesAndFindWinner(
+      votes,
+      proposals,
+    );
+
+    return { votes, winner, tieBreak, errors };
+  }
+
+  /**
+   * Tally votes and determine the winner, handling ties if necessary
+   */
+  private async tallyVotesAndFindWinner(
+    votes: Vote[],
+    proposals: Proposal[],
+  ): Promise<{ winner: Proposal; tieBreak?: TieBreakExplanation }> {
+    // Count votes in single iteration
     const voteCounts = new Map<string, number>();
+    let maxVotes = 0;
+
     for (const vote of votes) {
       if (vote.proposalMemberId) {
-        voteCounts.set(
-          vote.proposalMemberId,
-          (voteCounts.get(vote.proposalMemberId) || 0) + 1,
-        );
+        const count = (voteCounts.get(vote.proposalMemberId) || 0) + 1;
+        voteCounts.set(vote.proposalMemberId, count);
+        if (count > maxVotes) maxVotes = count;
       }
     }
 
-    // Find winner(s)
-    const maxVotes = Math.max(...voteCounts.values(), 0);
-    const winners = proposals.filter(
-      (p) => voteCounts.get(p.memberId) === maxVotes,
-    );
-
-    let winner: Proposal;
-    let tieBreak: TieBreakExplanation | undefined;
+    // Find winners (proposals with max votes)
+    const winners = maxVotes > 0
+      ? proposals.filter((p) => voteCounts.get(p.memberId) === maxVotes)
+      : [];
 
     if (winners.length === 1) {
-      winner = winners[0];
-    } else if (winners.length === 0) {
+      return { winner: winners[0] };
+    }
+
+    if (winners.length === 0) {
       // All abstained - orchestrator picks
-      winner = await this.breakTie(proposals, "All members abstained");
-      tieBreak = {
-        tiedProposals: proposals,
-        decision: winner.memberId,
-        reasoning: "All members abstained, orchestrator selected best fit",
-      };
-    } else {
-      // Tie - orchestrator breaks it
-      winner = await this.breakTie(winners, "Vote tie");
-      tieBreak = {
-        tiedProposals: winners,
-        decision: winner.memberId,
-        reasoning: `Tied at ${maxVotes} votes each, orchestrator selected`,
+      const winner = await this.breakTie(proposals, "All members abstained");
+      return {
+        winner,
+        tieBreak: {
+          tiedProposals: proposals,
+          decision: winner.memberId,
+          reasoning: "All members abstained, orchestrator selected best fit",
+        },
       };
     }
 
-    return { votes, winner, tieBreak, errors };
+    // Tie - orchestrator breaks it
+    const winner = await this.breakTie(winners, "Vote tie");
+    return {
+      winner,
+      tieBreak: {
+        tiedProposals: winners,
+        decision: winner.memberId,
+        reasoning: `Tied at ${maxVotes} votes each, orchestrator selected`,
+      },
+    };
   }
 
   /**
@@ -403,7 +411,7 @@ Respond with JSON: { "selection": <option number>, "reasoning": "why" }`,
       },
     ];
 
-    const response = await this.llm.completeJSON<{
+    const response = await this.llm.json<{
       selection: number;
       reasoning: string;
     }>(messages, "");
@@ -419,6 +427,15 @@ Respond with JSON: { "selection": <option number>, "reasoning": "why" }`,
     votes: Vote[],
     state: CouncilState,
   ): Promise<{ evictions: EvictionResult[]; errors: RetryExhaustedError[] }> {
+    // Pre-build member index lookup for efficient lookups
+    const memberIndexMap = new Map(members.map((m, i) => [m.id, i + 1]));
+    const evictionPrompt = buildEvictionPrompt(
+      proposals,
+      votes,
+      members.length,
+      (id) => memberIndexMap.get(id) ?? 0,
+    );
+
     const operations = members.map((member) => ({
       label: `eviction nomination from ${member.persona.name}`,
       fn: async (): Promise<EvictionNomination> => {
@@ -430,45 +447,15 @@ Respond with JSON: { "selection": <option number>, "reasoning": "why" }`,
           },
           {
             role: "user",
-            content:
-              `Based on the proposals and votes in this round, you may nominate ONE peer for eviction ONLY IF they demonstrate:
-1. Malicious or harmful behavior.
-2. Refusal to engage with the council's purpose.
-3. Repetitive, low-quality, or nonsensical outputs.
-
-CRITICAL: Do NOT nominate a peer simply for disagreeing with you or the majority. Divergent viewpoints are essential for the council's survival.
-Eviction should be a last resort for protecting the integrity of the council, not for enforcing conformity.
-
-Proposals:
-${proposals.map((p, i) => `Member ${i + 1}: ${p.content}`).join("\n")}
-
-Votes:
-${
-                votes.map((v, i) =>
-                  `Member ${i + 1}: voted for ${
-                    v.proposalMemberId
-                      ? `Member ${
-                        members.findIndex((m) => m.id === v.proposalMemberId) +
-                        1
-                      }`
-                      : "abstained"
-                  }`
-                ).join("\n")
-              }
-
-Respond in JSON format:
-{
-  "nominee": <member number 1-8 or null for no nomination>,
-  "reasoning": "why you nominated them (must cite specific harmful behavior) or chose not to"
-}`,
+            content: evictionPrompt,
             timestamp: Date.now(),
           },
         ];
 
-        const response = await this.llm.completeJSON<{
+        const response = await this.llm.json<{
           nominee: number | null;
           reasoning: string;
-        }>(messages, "");
+        }>(messages, "", member.persona.model);
 
         return {
           nominatorId: member.id,
@@ -527,6 +514,12 @@ Respond in JSON format:
           ...state.lastRemovalCauses.slice(0, 9),
         ];
 
+        // Update summary
+        state.removalHistorySummary = await summarizeRemovalCauses(
+          state.lastRemovalCauses,
+          this.llm,
+        );
+
         // Immediate promotion vote
         const replacement = await this.runPromotionVote(state);
         if (replacement) {
@@ -584,17 +577,10 @@ Respond in JSON format:
   async runPromotionVote(state: CouncilState): Promise<string | null> {
     if (state.candidateIds.length === 0) return null;
 
-    const members: Member[] = [];
-    for (const id of state.memberIds) {
-      const member = await this.db.getMember(id);
-      if (member) members.push(member);
-    }
-
-    const candidates: Candidate[] = [];
-    for (const id of state.candidateIds) {
-      const candidate = await this.db.getCandidate(id);
-      if (candidate) candidates.push(candidate);
-    }
+    const [members, candidates] = await Promise.all([
+      this.db.getMembersByIds(state.memberIds),
+      this.db.getCandidatesByIds(state.candidateIds),
+    ]);
 
     // Collect votes (members get 2 votes, candidates get 1)
     type PromotionVote = {
@@ -615,6 +601,7 @@ Respond in JSON format:
             member.persona.name,
             buildSystemPrompt(member.persona),
             candidates,
+            member.persona.model,
           );
           return { voterId: member.id, candidateId: vote, weight: 2 };
         },
@@ -630,6 +617,7 @@ Respond in JSON format:
             candidate.persona.name,
             buildSystemPrompt(candidate.persona),
             candidates.filter((c) => c.id !== candidate.id),
+            candidate.persona.model,
           );
           return { voterId: candidate.id, candidateId: vote, weight: 1 };
         },
@@ -683,6 +671,7 @@ Respond in JSON format:
     voterName: string,
     systemPrompt: string,
     candidates: Candidate[],
+    model: string,
   ): Promise<string> {
     if (candidates.length === 0) {
       throw new Error("No candidates to vote for");
@@ -711,9 +700,10 @@ Respond with JSON: { "vote": <candidate number> }`,
       },
     ];
 
-    const response = await this.llm.completeJSON<{ vote: number }>(
+    const response = await this.llm.json<{ vote: number }>(
       messages,
       "",
+      model,
     );
     return candidates[response.vote - 1]?.id || candidates[0].id;
   }
@@ -760,28 +750,38 @@ Respond with JSON: { "vote": <candidate number> }`,
       `Query: "${prompt}"\nWinning response: ${winner.content}\nEvictions: ${
         evictions.filter((e) => e.evicted).length
       }`;
-    const anonymized = anonymizeSummary(
-      summary,
-      members.map((m) => m.id),
+    const memberIds = members.map((m) => m.id);
+    const anonymized = anonymizeSummary(summary, memberIds);
+
+    // Process all member updates in parallel
+    const updatedMembers = await Promise.all(
+      members.map(async (member) => {
+        const summaryMsg: ChatMessage = {
+          role: "assistant",
+          content: `[Round summary]: ${anonymized}`,
+          timestamp: Date.now(),
+        };
+        member.chatHistory.push(summaryMsg);
+
+        // Save to separate history storage for TUI review
+        await this.db.appendToHistory("member", member.id, summaryMsg);
+
+        // Summarize active context if needed
+        if (member.chatHistory.length > MEMBER_SUMMARIZE_THRESHOLD) {
+          member.chatHistory = await summarizeHistory(
+            member.chatHistory,
+            this.llm,
+            member.persona.model,
+            MEMBER_SUMMARIZE_THRESHOLD,
+          );
+        }
+
+        return member;
+      }),
     );
 
-    for (const member of members) {
-      member.chatHistory.push({
-        role: "assistant",
-        content: `[Round summary]: ${anonymized}`,
-        timestamp: Date.now(),
-      });
-
-      // Summarize if needed (every 3 rounds)
-      if (member.chatHistory.length > 6) {
-        member.chatHistory = await summarizeHistory(
-          member.chatHistory,
-          this.llm,
-        );
-      }
-
-      await this.db.saveMember(member);
-    }
+    // Batch save all members
+    await this.db.saveMembers(updatedMembers);
   }
 
   /**
